@@ -6,7 +6,7 @@
 ;; Homepage: https://github.com/cbpnk/org-noter-pdf
 ;; Keywords: org-noter pdf
 ;; Package-Requires: ((org-noter-core "1.5.0") (pdf-tools "1.0"))
-;; Version: 1.5.0
+;; Version: 1.5.1
 
 ;; This file is not part of GNU Emacs.
 
@@ -48,13 +48,22 @@ This is needed in order to keep Emacs from hanging when doing many syncs."
 
 (add-hook 'org-noter--mode-supported-hook #'org-noter-pdf-view--mode-supported)
 
+(defun org-noter-pdf-view--region-p (location)
+  (and
+   location
+   (consp location)
+   (symbolp (car location))
+   (eq (car location) 'region)))
+
 (defun org-noter-pdf-view--doc-approx-location (major-mode &optional precise-info _force-new-ref)
   (when (org-noter-pdf-view--mode-supported major-mode)
-    (cons (image-mode-window-get 'page)
-          (if (and (listp precise-info)
-                   (numberp (car precise-info))
-                   (numberp (cadr precise-info)))
-              precise-info 0))))
+    (if (and (listp precise-info) (eq (car precise-info) 'region))
+        (cons 'region (cons (image-mode-window-get 'page) (cdr precise-info)))
+        (cons (image-mode-window-get 'page)
+              (if (and (listp precise-info)
+                       (numberp (car precise-info))
+                       (numberp (cadr precise-info)))
+                  precise-info 0)))))
 
 (add-hook 'org-noter--doc-approx-location-hook #'org-noter-pdf-view--doc-approx-location)
 
@@ -66,22 +75,64 @@ This is needed in order to keep Emacs from hanging when doing many syncs."
 
 (add-hook 'org-noter--set-up-document-hook #'org-noter-pdf-view--set-up-document)
 
+(defun org-noter-pdf-view--check-location-property (property)
+  (org-noter--with-valid-session
+   (when (org-noter-pdf-view--mode-supported (org-noter--session-doc-mode session))
+     (let ((value (car (read-from-string property))))
+       (org-noter-pdf-view--region-p value)))))
+
+(add-hook 'org-noter--check-location-property-hook 'org-noter-pdf-view--check-location-property)
+
+(defun org-noter-pdf-view--parse-location-property (property)
+  (org-noter--with-valid-session
+   (when (org-noter-pdf-view--mode-supported (org-noter--session-doc-mode session))
+     (let ((value (car (read-from-string property))))
+       (when (org-noter-pdf-view--region-p value)
+         value)))))
+
+(add-hook 'org-noter--parse-location-property-hook 'org-noter-pdf-view--parse-location-property)
 
 (defun org-noter-pdf-view--pretty-print-location (location)
   (org-noter--with-valid-session
    (when (org-noter-pdf-view--mode-supported (org-noter--session-doc-mode session))
-     (format "%s" (if (or (not (org-noter--get-location-top location))
-                          (<= (org-noter--get-location-top location) 0))
-                      (car location)
-                    location)))))
+     (if (org-noter-pdf-view--region-p location)
+         (format "%s" location)
+       (format "%s" (if (or (not (org-noter--get-location-top location))
+                            (<= (org-noter--get-location-top location) 0))
+                        (car location)
+                      location))))))
 
 (add-hook 'org-noter--pretty-print-location-hook #'org-noter-pdf-view--pretty-print-location)
+
+
+(defun org-noter-pdf-view--convert-to-location-cons (location)
+  (org-noter--with-valid-session
+   (when (org-noter-pdf-view--mode-supported (org-noter--session-doc-mode session))
+     (when (org-noter-pdf-view--region-p location)
+       (cons (car (cdr location))  (cadar (cdr (cdr location))))))))
+
+(add-hook 'org-noter--convert-to-location-cons-hook 'org-noter-pdf-view--convert-to-location-cons)
+
+(defun org-noter-pdf-view--note-after-tipping-point (point location view)
+  (org-noter--with-valid-session
+   (when (org-noter-pdf-view--mode-supported (org-noter--session-doc-mode session))
+     (when (org-noter-pdf-view--region-p location)
+       (cons t (org-noter--note-after-tipping-point point (org-noter-pdf-view--convert-to-location-cons location) view))))))
+
+(add-hook 'org-noter--note-after-tipping-point-hook #'org-noter-pdf-view--note-after-tipping-point)
+
+(defun org-noter-pdf-view--relative-position-to-view (location view)
+  (org-noter--with-valid-session
+   (when (org-noter-pdf-view--mode-supported (org-noter--session-doc-mode session))
+     (when (org-noter-pdf-view--region-p location)
+       (org-noter--relative-position-to-view (org-noter-pdf-view--convert-to-location-cons location) view)))))
+
+(add-hook 'org-noter--relative-position-to-view-hook #'org-noter-pdf-view--relative-position-to-view)
 
 (defun org-noter-pdf-view--get-precise-info (major-mode)
   (when (org-noter-pdf-view--mode-supported major-mode)
     (if (pdf-view-active-region-p)
-        (let ((edges (pdf-view-active-region)))
-          (car edges))
+        (cons 'region (pdf-view-active-region))
 
       (let (event)
         (while (not (and (eq 'mouse-1 (car event))
@@ -145,21 +196,27 @@ This is needed in order to keep Emacs from hanging when doing many syncs."
 
 (defun org-noter-pdf-view--doc-goto-location (mode location)
   (when (eq mode 'pdf-view-mode)
-    (let ((top (org-noter--get-location-top location))
-          (left (org-noter--get-location-left location)))
+    (if (not (org-noter-pdf-view--region-p location))
+        (let ((top (org-noter--get-location-top location))
+              (left (org-noter--get-location-left location)))
 
-      (pdf-view-goto-page (org-noter--get-location-page location))
-      ;; NOTE(nox): This timer is needed because the tooltip may introduce a delay,
-      ;; so syncing multiple pages was slow
-      (when (>= org-noter-pdf-arrow-delay 0)
-        (when org-noter-pdf-view--arrow-location (cancel-timer (aref org-noter-pdf-view--arrow-location 0)))
-        (setq org-noter-pdf-view--arrow-location
-              (vector (run-with-idle-timer org-noter-pdf-arrow-delay nil 'org-noter-pdf-view--show-arrow)
-                      (selected-window)
-                      top
-                      left)))
-      (image-scroll-up (- (org-noter--conv-page-percentage-scroll top)
-                          (window-vscroll))))))
+          (pdf-view-goto-page (org-noter--get-location-page location))
+          ;; NOTE(nox): This timer is needed because the tooltip may introduce a delay,
+          ;; so syncing multiple pages was slow
+          (when (>= org-noter-pdf-arrow-delay 0)
+            (when org-noter-pdf-view--arrow-location (cancel-timer (aref org-noter-pdf-view--arrow-location 0)))
+            (setq org-noter-pdf-view--arrow-location
+                  (vector (run-with-idle-timer org-noter-pdf-arrow-delay nil 'org-noter-pdf-view--show-arrow)
+                          (selected-window)
+                          top
+                          left)))
+          (image-scroll-up (- (org-noter--conv-page-percentage-scroll top)
+                              (window-vscroll))))
+      (pdf-view-goto-page (car (cdr location)))
+      (setq pdf-view-active-region (cdr (cdr location)))
+      (pdf-view--push-mark)
+      (pdf-view-display-region)
+      t)))
 
 (add-hook 'org-noter--doc-goto-location-hook #'org-noter-pdf-view--doc-goto-location)
 
@@ -177,7 +234,7 @@ This is needed in order to keep Emacs from hanging when doing many syncs."
 (add-hook 'org-noter-get-selected-text-hook #'org-noter-pdf-view--get-selected-text)
 
 ;; NOTE(nox): From machc/pdf-tools-org
-(defun org-noter--pdf-tools-edges-to-region (edges)
+(defun org-noter-pdf-view--edges-to-region (edges)
   "Get 4-entry region (LEFT TOP RIGHT BOTTOM) from several EDGES."
   (when edges
     (let ((left0 (nth 0 (car edges)))
@@ -244,7 +301,7 @@ This is needed in order to keep Emacs from hanging when doing many syncs."
              (dolist (item (pdf-info-getannots))
                (let* ((type (alist-get 'type item))
                       (page (alist-get 'page item))
-                      (edges (or (org-noter--pdf-tools-edges-to-region (alist-get 'markup-edges item))
+                      (edges (or (org-noter-pdf-view--edges-to-region (alist-get 'markup-edges item))
                                  (alist-get 'edges item)))
                       (top (nth 1 edges))
                       (item-subject (alist-get 'subject item))
